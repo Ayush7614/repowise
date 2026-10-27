@@ -5,7 +5,11 @@ calls (consumers). Each framework / client library is an independent *dialect*
 module registered in :data:`PROVIDER_DIALECTS` / :data:`CONSUMER_DIALECTS`; the
 :class:`HttpExtractor` orchestrator owns only the file walk and dispatch. Adding
 a framework means dropping one dialect module and appending it to a registry —
-no orchestrator edits.
+no orchestrator edits. HTTP keeps its own orchestrator rather than the shared
+:class:`..dialect.DialectExtractor` because it runs two passes the others do
+not: router mounts collected across files, and the index-backed routes and
+client calls. Each dialect still runs through :func:`..dialect.run_dialect`,
+the one gate and comment check every contract type shares.
 """
 
 from __future__ import annotations
@@ -13,18 +17,39 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from ..base import ScanContext, select_files
+from ..dialect import ContractDialect, run_dialect, union_extensions
 from ..langs import PYTHON
+from .apex_callouts import ApexCalloutsDialect
+from .apex_rest import ApexRestDialect
 from .aspnet import AspNetDialect
+from .azure_functions import AzureFunctionsDialect
 from .csharp_http import CSharpHttpDialect
-from .dialect import HttpDialect
+from .django import DjangoDialect
 from .express import ExpressDialect
 from .fastapi import FastApiDialect
+from .fastify import FastifyDialect
+from .flask import FlaskDialect
 from .go import GoDialect
+from .go_clients import GoClientsDialect
+from .hapi import HapiDialect
+from .java_clients import JavaClientsDialect, MicroProfileClientsDialect, SpringClientsDialect
+from .javalin import JavalinDialect
+from .jaxrs import JaxRsDialect
 from .js_clients import JsClientsDialect
+from .koa import KoaDialect
+from .kotlin_clients import KotlinClientsDialect
+from .ktor_server import KtorServerDialect
 from .laravel import LaravelDialect
+from .micronaut import MicronautDialect
 from .mounts import merge_mount_maps
+from .nestjs import NestDialect
+from .next_app import NextAppDialect
 from .paths import normalize_http_path
+from .php_clients import PhpClientsDialect
 from .python_clients import PythonClientsDialect
+from .refit import RefitDialect
+from .remix import RemixDialect
+from .ruby_clients import RubyClientsDialect
 from .rust_axum import RustAxumDialect
 from .rust_clients import RustClientsDialect
 from .spring import SpringDialect
@@ -34,26 +59,50 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from repowise.core.workspace.contracts import Contract
+    from repowise.core.workspace.repo_index import RepoIndex
 
     from ..base import SourceFile
 
 # Route-declaration recognisers (one framework each).
-PROVIDER_DIALECTS: tuple[HttpDialect, ...] = (
+PROVIDER_DIALECTS: tuple[ContractDialect, ...] = (
     ExpressDialect(),
+    NestDialect(),
     FastApiDialect(),
+    FlaskDialect(),
     SpringDialect(),
     LaravelDialect(),
     GoDialect(),
     AspNetDialect(),
     RustAxumDialect(),
+    DjangoDialect(),
+    JaxRsDialect(),
+    MicronautDialect(),
+    KtorServerDialect(),
+    JavalinDialect(),
+    NextAppDialect(),
+    RemixDialect(),
+    ApexRestDialect(),
+    AzureFunctionsDialect(),
+    FastifyDialect(),
+    HapiDialect(),
+    KoaDialect(),
 )
 
 # HTTP-client call recognisers (one client/language each).
-CONSUMER_DIALECTS: tuple[HttpDialect, ...] = (
+CONSUMER_DIALECTS: tuple[ContractDialect, ...] = (
     JsClientsDialect(),
     PythonClientsDialect(),
     CSharpHttpDialect(),
     RustClientsDialect(),
+    GoClientsDialect(),
+    RubyClientsDialect(),
+    JavaClientsDialect(),
+    KotlinClientsDialect(),
+    PhpClientsDialect(),
+    ApexCalloutsDialect(),
+    SpringClientsDialect(),
+    MicroProfileClientsDialect(),
+    RefitDialect(),
 )
 
 
@@ -70,25 +119,16 @@ _INDEX_BACKED_DIALECTS = frozenset({"fastapi"})
 _INDEX_BACKED_CONSUMER_DIALECTS = frozenset({"js-clients"})
 
 
-def _union_extensions(dialects: tuple[HttpDialect, ...]) -> frozenset[str]:
-    out: set[str] = set()
-    for d in dialects:
-        out |= d.extensions
-    return frozenset(out)
-
-
 class HttpExtractor:
     """Extract HTTP route contracts from source files via registered dialects."""
 
-    provider_dialects: tuple[HttpDialect, ...] = PROVIDER_DIALECTS
-    consumer_dialects: tuple[HttpDialect, ...] = CONSUMER_DIALECTS
+    provider_dialects: tuple[ContractDialect, ...] = PROVIDER_DIALECTS
+    consumer_dialects: tuple[ContractDialect, ...] = CONSUMER_DIALECTS
 
     @classmethod
     def source_extensions(cls) -> frozenset[str]:
         """Every extension this extractor's dialects claim."""
-        return _union_extensions(cls.provider_dialects) | _union_extensions(
-            cls.consumer_dialects
-        )
+        return union_extensions(cls.provider_dialects + cls.consumer_dialects)
 
     def extract(
         self,
@@ -96,8 +136,7 @@ class HttpExtractor:
         repo_alias: str = "",
         exclude: Callable[[str], bool] | None = None,
         files: Sequence[SourceFile] | None = None,
-        index: dict[str, object] | None = None,
-        content_hashes: dict[str, str] | None = None,
+        repo_index: RepoIndex | None = None,
         stats: dict[str, int] | None = None,
     ) -> list[Contract]:
         """Scan all source files in *repo_path* and return Contract instances.
@@ -108,57 +147,54 @@ class HttpExtractor:
 
         *files* is an already-walked ``(rel_path, suffix, content)`` list from
         the orchestrator's single traversal; None walks the repo directly.
-        *index* maps ``rel_path -> ParsedFile`` from the repo's parse cache. A
-        file present there gets its Python routes from the parsed decorators
-        rather than from the FastAPI text regex — a decorator node cannot carry
-        a route from a comment, and cannot lose an empty path. *content_hashes*
-        is the walk's ``rel_path -> sha256`` map, which is what proves a cached
-        parse describes the file as it is now; without it the index is unused.
+        *repo_index* is the repo's read-only symbol table. A file it has
+        symbols for gets its Python routes from the declarations above those
+        symbols rather than from the FastAPI text regex, which is what stops a
+        route in a comment becoming a contract and an empty path being lost.
 
         *stats* is an optional out-dict of counters. ``http_consumer_unresolved``
-        counts calls to a *confirmed* HTTP wrapper whose path argument could not
-        be resolved statically — real endpoint calls that were located but
-        cannot be named. They are counted rather than dropped, so a recall
-        figure built from these contracts states its own denominator.
+        counts calls to a *confirmed* HTTP wrapper, or through a variable bound
+        to an HTTP client instance, whose path argument could not be resolved
+        statically — real endpoint calls that were located but cannot be named.
+        They are counted rather than dropped, so a recall figure built from
+        these contracts states its own denominator.
         """
-        own_hashes: dict[str, str] | None = None
-        if files is None and index is not None and content_hashes is None:
-            own_hashes = content_hashes = {}
-        scanned = select_files(
-            repo_path, self.source_extensions(), exclude, files, own_hashes
-        )
-        mounts = self._collect_mounts(scanned)
+        scanned = select_files(repo_path, self.source_extensions(), exclude, files)
+        mounts = self._collect_mounts(scanned, repo_alias)
 
-        from ..from_index import CONSUMER_INDEX_SUFFIXES, extract_http_providers, parsed_for
+        from ..from_index import (
+            CONSUMER_INDEX_SUFFIXES,
+            extract_http_providers,
+            symbols_for_content,
+        )
         from .index_clients import extract_consumers
 
         contracts: list[Contract] = []
         for rel_path, suffix, content in scanned:
-            ctx = ScanContext(repo_alias, rel_path, suffix, content, mounts)
-            # Only a parse that matches the bytes just walked supersedes the
-            # regex; a stale or missing entry leaves the dialect in charge.
-            parsed = (
-                parsed_for(index, rel_path, (content_hashes or {}).get(rel_path))
-                if suffix in PYTHON or suffix in CONSUMER_INDEX_SUFFIXES
-                else None
-            )
+            ctx = ScanContext(repo_alias, rel_path, suffix, content, mounts, repo_index)
+            # Python sits in both sets now, so one test covers the provider
+            # pass (which reads the declarations above a span) and the consumer
+            # pass (which reads the span itself).
+            indexed = suffix in CONSUMER_INDEX_SUFFIXES
+            # Only spans that can still describe this file's text supersede the
+            # regex; a missing or overrun entry leaves the dialect in charge.
+            symbols = symbols_for_content(ctx, content.count("\n") + 1) if indexed else []
+            lines = content.split("\n") if symbols else []
             # Run the index pass first: it only supersedes the text dialect for
-            # a file it actually produced routes for. A parse that yielded no
+            # a file it actually produced routes for. A file that yielded no
             # decorated symbols (a grammar the parser stumbled on, a route
             # shape the queries do not capture) must not silently delete the
             # routes the regex can still see in the file's text.
             from_parse = (
-                extract_http_providers(ctx, parsed)
-                if parsed is not None and suffix in PYTHON
-                else []
+                extract_http_providers(ctx, symbols, lines) if symbols and suffix in PYTHON else []
             )
             contracts.extend(from_parse)
 
             # Consumers, under the same per-file supersede rule: calls at the
             # sites of wrappers confirmed to reach an HTTP sink.
             consumers_from_parse: list[Contract] = []
-            if parsed is not None and suffix in CONSUMER_INDEX_SUFFIXES:
-                consumers_from_parse, unresolved = extract_consumers(ctx, parsed)
+            if symbols and suffix in CONSUMER_INDEX_SUFFIXES:
+                consumers_from_parse, unresolved = extract_consumers(ctx, symbols)
                 contracts.extend(consumers_from_parse)
                 if stats is not None and unresolved:
                     stats["http_consumer_unresolved"] = (
@@ -166,16 +202,12 @@ class HttpExtractor:
                     )
 
             for dialect in self.provider_dialects:
-                if suffix not in dialect.extensions:
-                    continue
                 if from_parse and dialect.name in _INDEX_BACKED_DIALECTS:
                     continue  # superseded by the index pass above
-                contracts.extend(dialect.extract(ctx))
+                contracts.extend(run_dialect(dialect, ctx))
             index_ids = {c.contract_id for c in consumers_from_parse}
             for dialect in self.consumer_dialects:
-                if suffix not in dialect.extensions:
-                    continue
-                found = dialect.extract(ctx)
+                found = run_dialect(dialect, ctx)
                 if index_ids and dialect.name in _INDEX_BACKED_CONSUMER_DIALECTS:
                     # Supersede per *contract*, not per file. Dropping the whole
                     # dialect for a file the index read would delete anything
@@ -187,19 +219,27 @@ class HttpExtractor:
                 contracts.extend(found)
         return contracts
 
-    def _collect_mounts(self, files: list[tuple[str, str, str]]) -> dict[str, str]:
+    def _collect_mounts(self, files: list[SourceFile], repo_alias: str) -> dict[str, str]:
         """Build the unambiguous repo-wide ``router-var -> mount-prefix`` map.
 
-        Each provider dialect may expose ``collect_mounts(content)``; results are
-        merged across every file, dropping any router name mounted at conflicting
-        prefixes (see :func:`merge_mount_maps`).
+        Any dialect may expose ``collect_mounts(ctx)``: a router mount, where
+        an app serves its routes, or a client instance another file imports.
+        Results are merged across every file, dropping any key two files
+        disagree on (see :func:`merge_mount_maps`).
         """
+        collectors = [
+            d
+            for d in self.provider_dialects + self.consumer_dialects
+            if hasattr(d, "collect_mounts")
+        ]
         per_file: list[dict[str, str]] = []
-        for _rel, suffix, content in files:
-            for dialect in self.provider_dialects:
-                collect = getattr(dialect, "collect_mounts", None)
-                if collect is not None and suffix in dialect.extensions:
-                    found = collect(content)
+        for rel_path, suffix, content in files:
+            ctx = ScanContext(repo_alias, rel_path, suffix, content)
+            for dialect in collectors:
+                # A collector may gate its repo-wide pass apart from extraction.
+                gate = getattr(dialect, "mount_requires", dialect.requires)
+                if ctx.suffix in dialect.extensions and ctx.has_any(gate):
+                    found = dialect.collect_mounts(ctx)
                     if found:
                         per_file.append(found)
         return merge_mount_maps(per_file)

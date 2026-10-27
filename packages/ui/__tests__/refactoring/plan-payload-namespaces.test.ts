@@ -85,15 +85,39 @@ describe("helperSite namespace", () => {
 });
 
 describe("extract_method suggested_name reaches the rendered prompt", () => {
-  it("uses the computed name instead of the generic fallback", () => {
-    const prompt = buildRefactoringPlanPrompt({ plan: methodPlan("compute_average") });
-    expect(prompt).toContain("compute_average");
+  it("uses the plan's placeholder and asks the agent to rename it", () => {
+    const prompt = buildRefactoringPlanPrompt({ plan: methodPlan("_extracted_helper") });
+    expect(prompt).toContain("into `_extracted_helper`:");
+    expect(prompt).toContain("The helper's name is a placeholder: rename it");
     expect(prompt).not.toContain("a clearly named helper");
   });
 
-  it("keeps the generic fallback for a plan stored before names were computed", () => {
+  it("asks the agent to name a helper stored without a name", () => {
     const prompt = buildRefactoringPlanPrompt({ plan: methodPlan(null) });
-    expect(prompt).toContain("a clearly named helper");
+    expect(prompt).toContain("into `<name>`:");
+    expect(prompt).toContain("The helper's name is a placeholder: rename it");
     expect(extractMethodPlan(methodPlan(null)).suggested_name).toBeNull();
+  });
+
+  it("includes the canonical validation plan in copy-to-agent handoff", () => {
+    const plan: RefactoringPlan = {
+      ...methodPlan("compute_average"),
+      validation: {
+        basis: "measured",
+        via: "coverage",
+        total: 1,
+        tests: ["tests/test_pipeline.py::test_average"],
+        truncated: false,
+        affected_files: ["pkg/pipeline.py"],
+        affected_symbols: ["run_pipeline"],
+        commands: ["pytest tests/test_pipeline.py::test_average"],
+        targets: [],
+      },
+    };
+    const prompt = buildRefactoringPlanPrompt({ plan });
+    expect(prompt).toContain("## Verify");
+    expect(prompt).toContain("guarding test via coverage");
+    expect(prompt).toContain("tests/test_pipeline.py::test_average");
+    expect(prompt).toContain("pytest tests/test_pipeline.py::test_average");
   });
 });
